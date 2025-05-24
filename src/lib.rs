@@ -6,15 +6,13 @@ pub mod postprocessors;
 mod references;
 mod walker;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::prelude::*;
-use std::io::ErrorKind;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::{fmt, str};
 
 pub use context::Context;
-use filetime::set_file_mtime;
 use frontmatter::{frontmatter_from_str, frontmatter_to_str};
 pub use frontmatter::{Frontmatter, FrontmatterStrategy};
 use pathdiff::diff_paths;
@@ -75,12 +73,9 @@ pub type MarkdownEvents<'a> = Vec<Event<'a>>;
 /// use obsidian_export::serde_yaml::Value;
 /// use obsidian_export::{Exporter, PostprocessorResult};
 /// # use std::path::PathBuf;
-/// # use tempfile::TempDir;
 ///
-/// # let tmp_dir = TempDir::new().expect("failed to make tempdir");
 /// # let source = PathBuf::from("tests/testdata/input/postprocessors");
-/// # let destination = tmp_dir.path().to_path_buf();
-/// let mut exporter = Exporter::new(source, destination);
+/// let mut exporter = Exporter::new(source);
 ///
 /// // add_postprocessor registers a new postprocessor. In this example we use a closure.
 /// exporter.add_postprocessor(&|context, _events| {
@@ -124,13 +119,13 @@ pub type MarkdownEvents<'a> = Vec<Event<'a>>;
 ///
 /// # let tmp_dir = TempDir::new().expect("failed to make tempdir");
 /// # let source = PathBuf::from("tests/testdata/input/postprocessors");
-/// # let destination = tmp_dir.path().to_path_buf();
-/// # let mut exporter = Exporter::new(source, destination);
+/// # let mut exporter = Exporter::new(source);
 /// exporter.add_postprocessor(&foo_to_bar);
 /// # exporter.run().unwrap();
 /// ```
-pub type Postprocessor<'f> =
+pub type StringPostprocessor<'f> =
     dyn Fn(&mut Context, &mut MarkdownEvents<'_>) -> PostprocessorResult + Send + Sync + 'f;
+
 type Result<T, E = ExportError> = std::result::Result<T, E>;
 
 const PERCENTENCODE_CHARS: &AsciiSet = &CONTROLS.add(b' ').add(b'(').add(b')').add(b'%').add(b'?');
@@ -236,22 +231,20 @@ pub enum PostprocessorResult {
 /// After that, calling [`Exporter::run`] will start the export process.
 pub struct Exporter<'a> {
     root: PathBuf,
-    destination: PathBuf,
     start_at: PathBuf,
     frontmatter_strategy: FrontmatterStrategy,
     vault_contents: Option<Vec<PathBuf>>,
     walk_options: WalkOptions<'a>,
     process_embeds_recursively: bool,
     preserve_mtime: bool,
-    postprocessors: Vec<&'a Postprocessor<'a>>,
-    embed_postprocessors: Vec<&'a Postprocessor<'a>>,
+    postprocessors_for_string: Vec<&'a StringPostprocessor<'a>>,
+    embed_postprocessors_for_string: Vec<&'a StringPostprocessor<'a>>,
 }
 
-impl<'a> fmt::Debug for Exporter<'a> {
+impl fmt::Debug for Exporter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalkOptions")
             .field("root", &self.root)
-            .field("destination", &self.destination)
             .field("frontmatter_strategy", &self.frontmatter_strategy)
             .field("vault_contents", &self.vault_contents)
             .field("walk_options", &self.walk_options)
@@ -262,13 +255,16 @@ impl<'a> fmt::Debug for Exporter<'a> {
             .field("preserve_mtime", &self.preserve_mtime)
             .field(
                 "postprocessors",
-                &format!("<{} postprocessors active>", self.postprocessors.len()),
+                &format!(
+                    "<{} postprocessors active>",
+                    self.postprocessors_for_string.len()
+                ),
             )
             .field(
                 "embed_postprocessors",
                 &format!(
                     "<{} postprocessors active>",
-                    self.embed_postprocessors.len()
+                    self.embed_postprocessors_for_string.len()
                 ),
             )
             .finish()
@@ -279,18 +275,17 @@ impl<'a> Exporter<'a> {
     /// Create a new exporter which reads notes from `root` and exports these to
     /// `destination`.
     #[must_use]
-    pub fn new(root: PathBuf, destination: PathBuf) -> Self {
+    pub fn new(root: PathBuf) -> Self {
         Self {
             start_at: root.clone(),
             root,
-            destination,
             frontmatter_strategy: FrontmatterStrategy::Auto,
             walk_options: WalkOptions::default(),
             process_embeds_recursively: true,
             preserve_mtime: false,
             vault_contents: None,
-            postprocessors: vec![],
-            embed_postprocessors: vec![],
+            embed_postprocessors_for_string: vec![],
+            postprocessors_for_string: vec![],
         }
     }
 
@@ -339,21 +334,31 @@ impl<'a> Exporter<'a> {
         self
     }
 
-    /// Append a function to the chain of [postprocessors][Postprocessor] to run on exported
+    /// Append a function to the chain of [postprocessors][StringPostprocessor] to run on exported
     /// Obsidian Markdown notes.
-    pub fn add_postprocessor(&mut self, processor: &'a Postprocessor<'_>) -> &mut Self {
-        self.postprocessors.push(processor);
+    pub fn add_postprocessor(&mut self, processor: &'a StringPostprocessor<'_>) -> &mut Self {
+        self.postprocessors_for_string.push(processor);
         self
     }
 
-    /// Append a function to the chain of [postprocessors][Postprocessor] for embeds.
-    pub fn add_embed_postprocessor(&mut self, processor: &'a Postprocessor<'_>) -> &mut Self {
-        self.embed_postprocessors.push(processor);
+    /// Append a function to the chain of [postprocessors][StringPostprocessor] for embeds.
+    pub fn add_embed_postprocessor(&mut self, processor: &'a StringPostprocessor<'_>) -> &mut Self {
+        self.embed_postprocessors_for_string.push(processor);
         self
     }
 
+    fn relative_path(&self, file: &Path) -> PathBuf {
+        let root = if self.start_at.is_file() {
+            self.start_at.clone().parent().unwrap().to_path_buf()
+        } else {
+            self.start_at.clone()
+        };
+        file.strip_prefix(&root)
+            .expect("file should always be nested under root")
+            .to_path_buf()
+    }
     /// Export notes using the settings configured on this exporter.
-    pub fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self) -> Result<HashMap<PathBuf, String>> {
         if !self.root.exists() {
             return Err(ExportError::PathDoesNotExist {
                 path: self.root.clone(),
@@ -369,106 +374,153 @@ impl<'a> Exporter<'a> {
         // iterating over all discovered files. This also allows us to accept destination as either
         // a file or a directory name.
         if self.root.is_file() || self.start_at.is_file() {
-            let source_filename = self
-                .start_at
-                .file_name()
-                .expect("File without a filename? How is that possible?")
-                .to_string_lossy();
-
-            let destination = match self.destination.is_dir() {
-                true => self.destination.join(String::from(source_filename)),
-                false => {
-                    let parent = self.destination.parent().unwrap_or(&self.destination);
-                    // Avoid recursively creating self.destination through the call to
-                    // export_note when the parent directory doesn't exist.
-                    if !parent.exists() {
-                        return Err(ExportError::PathDoesNotExist {
-                            path: parent.to_path_buf(),
-                        });
-                    }
-                    self.destination.clone()
-                }
-            };
-            return self.export_note(&self.start_at, &destination);
-        }
-
-        if !self.destination.exists() {
-            return Err(ExportError::PathDoesNotExist {
-                path: self.destination.clone(),
+            return self.export_note(&self.start_at).map(|note| {
+                note.map(|note| vec![(self.relative_path(&self.start_at), note)])
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
             });
         }
+
         self.vault_contents
             .as_ref()
             .unwrap()
             .clone()
             .into_par_iter()
             .filter(|file| file.starts_with(&self.start_at))
-            .try_for_each(|file| {
-                let relative_path = file
-                    .strip_prefix(self.start_at.clone())
-                    .expect("file should always be nested under root")
-                    .to_path_buf();
-                let destination = &self.destination.join(relative_path);
-                self.export_note(&file, destination)
-            })?;
-        Ok(())
+            .filter_map(|file| {
+                let result = self
+                    .export_note(&file)
+                    .map(|note| note.map(|note| (self.relative_path(&file), note)));
+                match result {
+                    Ok(Some(note)) => Some(Ok(note)),
+                    Ok(None) => None,
+                    Err(err) => Some(Err(err)),
+                }
+            })
+            .collect()
     }
 
-    fn export_note(&self, src: &Path, dest: &Path) -> Result<()> {
-        match is_markdown_file(src) {
-            true => self.parse_and_export_obsidian_note(src, dest),
-            false => copy_file(src, dest),
+    fn export_note(&self, src: &Path) -> Result<Option<String>> {
+        if is_markdown_file(src) {
+            self.parse_and_export_as_string(src)
+        } else {
+            Ok(None)
         }
-        .context(FileExportSnafu { path: src })?;
-
-        if self.preserve_mtime {
-            copy_mtime(src, dest).context(FileExportSnafu { path: src })?;
-        }
-
-        Ok(())
+        .context(FileExportSnafu { path: src })
     }
 
-    fn parse_and_export_obsidian_note(&self, src: &Path, dest: &Path) -> Result<()> {
-        let mut context = Context::new(src.to_path_buf(), dest.to_path_buf());
+    pub fn walk_vault(&mut self) -> Result<()> {
+        self.vault_contents = Some(vault_contents(
+            self.root.as_path(),
+            self.walk_options.clone(),
+        )?);
+        Ok(())
+    }
+    /*fn export_note(&self, src: &Path, dest: &Path) -> Result<()> {
+            if is_markdown_file(src) {
+                self.parse_and_export_obsidian_note(src, dest)
+            } else {
+                copy_file(src, dest)
+            }
+            .context(FileExportSnafu { path: src })?;
 
-        let (frontmatter, mut markdown_events) = self.parse_obsidian_note(src, &context)?;
+            if self.preserve_mtime {
+                copy_mtime(src, dest).context(FileExportSnafu { path: src })?;
+            }
+
+            Ok(())
+        }
+
+        fn parse_and_export_obsidian_note(&self, src: &Path, dest: &Path) -> Result<()> {
+            let mut context = Context::new(src.to_path_buf(), dest.to_path_buf());
+
+            let (frontmatter, mut markdown_events) = self.parse_obsidian_note(src, &context)?;
+            context.frontmatter = frontmatter;
+            for func in &self.postprocessors {
+                match func(&mut context, &mut markdown_events) {
+                    PostprocessorResult::StopHere => break,
+                    PostprocessorResult::StopAndSkipNote => return Ok(()),
+                    PostprocessorResult::Continue => (),
+                }
+            }
+
+            let mut outfile = create_file(&context.destination)?;
+            let write_frontmatter = match self.frontmatter_strategy {
+                FrontmatterStrategy::Always => true,
+                FrontmatterStrategy::Never => false,
+                FrontmatterStrategy::Auto => !context.frontmatter.is_empty(),
+            };
+            if write_frontmatter {
+                let mut frontmatter_str = frontmatter_to_str(&context.frontmatter)
+                    .context(FrontMatterEncodeSnafu { path: src })?;
+                frontmatter_str.push('\n');
+                outfile
+                    .write_all(frontmatter_str.as_bytes())
+                    .context(WriteSnafu {
+                        path: &context.destination,
+                    })?;
+            }
+            outfile
+                .write_all(render_mdevents_to_mdtext(&markdown_events).as_bytes())
+                .context(WriteSnafu {
+                    path: &context.destination,
+                })?;
+            Ok(())
+        }
+    */
+    /// Parses the given Obsidian note and exports its content as a string.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The Obsidian note cannot be parsed.
+    /// - A postprocessor fails or indicates to stop processing and skip the note.
+    /// - Writing the output file fails.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if:
+    /// - Creating a temporary file fails.
+    pub fn parse_and_export_as_string(&self, src: &Path) -> Result<Option<String>> {
+        let mut context = Context::new(src.to_path_buf());
+        let (frontmatter, mut markdown_events) =
+            self.parse_obsidian_note_for_string(src, &context)?;
         context.frontmatter = frontmatter;
-        for func in &self.postprocessors {
+        for func in &self.postprocessors_for_string {
             match func(&mut context, &mut markdown_events) {
                 PostprocessorResult::StopHere => break,
-                PostprocessorResult::StopAndSkipNote => return Ok(()),
+                PostprocessorResult::StopAndSkipNote => return Ok(None),
                 PostprocessorResult::Continue => (),
             }
         }
 
-        let mut outfile = create_file(&context.destination)?;
         let write_frontmatter = match self.frontmatter_strategy {
             FrontmatterStrategy::Always => true,
             FrontmatterStrategy::Never => false,
             FrontmatterStrategy::Auto => !context.frontmatter.is_empty(),
         };
-        if write_frontmatter {
-            let mut frontmatter_str = frontmatter_to_str(&context.frontmatter)
-                .context(FrontMatterEncodeSnafu { path: src })?;
-            frontmatter_str.push('\n');
-            outfile
-                .write_all(frontmatter_str.as_bytes())
-                .context(WriteSnafu {
-                    path: &context.destination,
-                })?;
-        }
-        outfile
-            .write_all(render_mdevents_to_mdtext(&markdown_events).as_bytes())
-            .context(WriteSnafu {
-                path: &context.destination,
-            })?;
-        Ok(())
+        let frontmatter_str = if write_frontmatter {
+            format!(
+                "{}\n",
+                frontmatter_to_str(&context.frontmatter)
+                    .context(FrontMatterEncodeSnafu { path: src })?
+            )
+        } else {
+            String::new()
+        };
+
+        Ok(Some(format!(
+            "{}{}",
+            frontmatter_str,
+            render_mdevents_to_mdtext(&markdown_events)
+        )))
     }
 
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::panic_in_result_fn)]
     #[allow(clippy::shadow_unrelated)]
-    fn parse_obsidian_note<'b>(
+    fn parse_obsidian_note_for_string<'b>(
         &self,
         path: &Path,
         context: &Context,
@@ -571,7 +623,7 @@ impl<'a> Exporter<'a> {
                 RefParserState::ExpectFinalCloseBracket => match event {
                     Event::Text(CowStr::Borrowed("]")) => match ref_parser.ref_type {
                         Some(RefType::Link) => {
-                            let mut elements = self.make_link_to_file(
+                            let mut elements = self.make_link_to_file_for_string(
                                 ObsidianNoteReference::from_str(
                                     ref_parser.ref_text.clone().as_ref()
                                 ),
@@ -582,7 +634,7 @@ impl<'a> Exporter<'a> {
                             ref_parser.transition(RefParserState::Resetting);
                         }
                         Some(RefType::Embed) => {
-                            let mut elements = self.embed_file(
+                            let mut elements = self.embed_file_for_string(
                                 ref_parser.ref_text.clone().as_ref(),
                                 context
                             )?;
@@ -608,13 +660,246 @@ impl<'a> Exporter<'a> {
             events.into_iter().map(event_to_owned).collect(),
         ))
     }
+    /*
+        #[allow(clippy::too_many_lines)]
+        #[allow(clippy::panic_in_result_fn)]
+        #[allow(clippy::shadow_unrelated)]
+        fn parse_obsidian_note<'b>(
+            &self,
+            path: &Path,
+            context: &Context,
+        ) -> Result<(Frontmatter, MarkdownEvents<'b>)> {
+            if context.note_depth() > NOTE_RECURSION_LIMIT {
+                return Err(ExportError::RecursionLimitExceeded {
+                    file_tree: context.file_tree(),
+                });
+            }
+            let content = fs::read_to_string(path).context(ReadSnafu { path })?;
+            let mut frontmatter = String::new();
 
-    // Generate markdown elements for a file that is embedded within another note.
-    //
-    // - If the file being embedded is a note, it's content is included at the point of embed.
-    // - If the file is an image, an image tag is generated.
-    // - For other types of file, a regular link is created instead.
-    fn embed_file<'b>(
+            let parser_options = Options::ENABLE_TABLES
+                | Options::ENABLE_FOOTNOTES
+                | Options::ENABLE_STRIKETHROUGH
+                | Options::ENABLE_TASKLISTS
+                | Options::ENABLE_MATH
+                | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+                | Options::ENABLE_GFM;
+
+            let mut ref_parser = RefParser::new();
+            let mut events = vec![];
+            // Most of the time, a reference triggers 5 events: [ or ![, [, <text>, ], ]
+            let mut buffer = Vec::with_capacity(5);
+
+            let mut parser = Parser::new_ext(&content, parser_options);
+            'outer: while let Some(event) = parser.next() {
+                // When encountering a metadata block (frontmatter), collect all events until getting
+                // to the end of the block, at which point the nested loop will break out to the outer
+                // loop again.
+                if matches!(event, Event::Start(Tag::MetadataBlock(_kind))) {
+                    for event in parser.by_ref() {
+                        match event {
+                            Event::Text(cowstr) => frontmatter.push_str(&cowstr),
+                            Event::End(TagEnd::MetadataBlock(_kind)) => {
+                                continue 'outer;
+                            },
+                            _ => panic!(
+                                "Encountered an unexpected event while processing frontmatter in {}. Please report this as a bug with a copy of the note contents and this text: \n\nEvent: {:?}\n",
+                                path.display(),
+                                event
+                            ),
+                        }
+                    }
+                }
+                if ref_parser.state == RefParserState::Resetting {
+                    events.append(&mut buffer);
+                    buffer.clear();
+                    ref_parser.reset();
+                }
+                buffer.push(event.clone());
+                match ref_parser.state {
+                    RefParserState::NoState => {
+                        match event {
+                            Event::Text(CowStr::Borrowed("![")) => {
+                                ref_parser.ref_type = Some(RefType::Embed);
+                                ref_parser.transition(RefParserState::ExpectSecondOpenBracket);
+                            }
+                            Event::Text(CowStr::Borrowed("[")) => {
+                                ref_parser.ref_type = Some(RefType::Link);
+                                ref_parser.transition(RefParserState::ExpectSecondOpenBracket);
+                            }
+                            _ => {
+                                events.push(event);
+                                buffer.clear();
+                            },
+                        };
+                    }
+                    RefParserState::ExpectSecondOpenBracket => match event {
+                        Event::Text(CowStr::Borrowed("[")) => {
+                            ref_parser.transition(RefParserState::ExpectRefText);
+                        }
+                        _ => {
+                            ref_parser.transition(RefParserState::Resetting);
+                        }
+                    },
+                    RefParserState::ExpectRefText => match event {
+                        Event::Text(CowStr::Borrowed("]")) => {
+                            ref_parser.transition(RefParserState::Resetting);
+                        }
+                        Event::Text(text) => {
+                            ref_parser.ref_text.push_str(&text);
+                            ref_parser.transition(RefParserState::ExpectRefTextOrCloseBracket);
+                        }
+                        _ => {
+                            ref_parser.transition(RefParserState::Resetting);
+                        }
+                    },
+                    RefParserState::ExpectRefTextOrCloseBracket => match event {
+                        Event::Text(CowStr::Borrowed("]")) => {
+                            ref_parser.transition(RefParserState::ExpectFinalCloseBracket);
+                        }
+                        Event::Text(text) => {
+                            ref_parser.ref_text.push_str(&text);
+                        }
+                        _ => {
+                            ref_parser.transition(RefParserState::Resetting);
+                        }
+                    },
+                    RefParserState::ExpectFinalCloseBracket => match event {
+                        Event::Text(CowStr::Borrowed("]")) => match ref_parser.ref_type {
+                            Some(RefType::Link) => {
+                                let mut elements = self.make_link_to_file(
+                                    ObsidianNoteReference::from_str(
+                                        ref_parser.ref_text.clone().as_ref()
+                                    ),
+                                    context,
+                                );
+                                events.append(&mut elements);
+                                buffer.clear();
+                                ref_parser.transition(RefParserState::Resetting);
+                            }
+                            Some(RefType::Embed) => {
+                                let mut elements = self.embed_file(
+                                    ref_parser.ref_text.clone().as_ref(),
+                                    context
+                                )?;
+                                events.append(&mut elements);
+                                buffer.clear();
+                                ref_parser.transition(RefParserState::Resetting);
+                            }
+                            None => panic!("In state ExpectFinalCloseBracket but ref_type is None"),
+                        },
+                        _ => {
+                            ref_parser.transition(RefParserState::Resetting);
+                        }
+                    },
+                    RefParserState::Resetting => panic!("Reached Resetting state, but it should have been handled prior to this match block"),
+                }
+            }
+            if !buffer.is_empty() {
+                events.append(&mut buffer);
+            }
+
+            Ok((
+                frontmatter_from_str(&frontmatter).context(FrontMatterDecodeSnafu { path })?,
+                events.into_iter().map(event_to_owned).collect(),
+            ))
+        }
+
+        // Generate markdown elements for a file that is embedded within another note.
+        //
+        // - If the file being embedded is a note, it's content is included at the point of embed.
+        // - If the file is an image, an image tag is generated.
+        // - For other types of file, a regular link is created instead.
+        fn embed_file<'b>(
+            &self,
+            link_text: &'a str,
+            context: &'a Context,
+        ) -> Result<MarkdownEvents<'b>> {
+            let note_ref = ObsidianNoteReference::from_str(link_text);
+
+            let path = match note_ref.file {
+                Some(file) => lookup_filename_in_vault(file, self.vault_contents.as_ref().unwrap()),
+
+                // If we have None file it is either to a section or id within the same file and thus
+                // the current embed logic will fail, recurssing until it reaches it's limit.
+                // For now we just bail early.
+                None => return Ok(self.make_link_to_file(note_ref, context)),
+            };
+
+            if path.is_none() {
+                // TODO: Extract into configurable function.
+                eprintln!(
+                    "Warning: Unable to find embedded note\n\tReference: '{}'\n\tSource: '{}'\n",
+                    note_ref
+                        .file
+                        .unwrap_or_else(|| context.current_file().to_str().unwrap()),
+                    context.current_file().display(),
+                );
+                return Ok(vec![]);
+            }
+
+            let path = path.unwrap();
+            let mut child_context = Context::from_parent(context, path);
+            let no_ext = OsString::new();
+
+            if !self.process_embeds_recursively && context.file_tree().contains(path) {
+                return Ok([
+                    vec![Event::Text(CowStr::Borrowed("→ "))],
+                    self.make_link_to_file(note_ref, &child_context),
+                ]
+                .concat());
+            }
+
+            let events = match path.extension().unwrap_or(&no_ext).to_str() {
+                Some("md") => {
+                    let (frontmatter, mut events) = self.parse_obsidian_note(path, &child_context)?;
+                    child_context.frontmatter = frontmatter;
+                    if let Some(section) = note_ref.section {
+                        events = reduce_to_section(events, section);
+                    }
+                    for func in &self.embed_postprocessors {
+                        // Postprocessors running on embeds shouldn't be able to change frontmatter (or
+                        // any other metadata), so we give them a clone of the context.
+                        match func(&mut child_context, &mut events) {
+                            PostprocessorResult::StopHere => break,
+                            PostprocessorResult::StopAndSkipNote => {
+                                events = vec![];
+                            }
+                            PostprocessorResult::Continue => (),
+                        }
+                    }
+                    events
+                }
+                Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") => {
+                    self.make_link_to_file(note_ref, &child_context)
+                        .into_iter()
+                        .map(|event| match event {
+                            // make_link_to_file returns a link to a file. With this we turn the link
+                            // into an image reference instead. Slightly hacky, but avoids needing
+                            // to keep another utility function around for this, or introducing an
+                            // extra parameter on make_link_to_file.
+                            Event::Start(Tag::Link {
+                                link_type,
+                                dest_url,
+                                title,
+                                id,
+                            }) => Event::Start(Tag::Image {
+                                link_type,
+                                dest_url: CowStr::from(dest_url.into_string()),
+                                title: CowStr::from(title.into_string()),
+                                id: CowStr::from(id.into_string()),
+                            }),
+                            Event::End(TagEnd::Link) => Event::End(TagEnd::Image),
+                            _ => event,
+                        })
+                        .collect()
+                }
+                _ => self.make_link_to_file(note_ref, &child_context),
+            };
+            Ok(events)
+        }
+    */
+    fn embed_file_for_string<'b>(
         &self,
         link_text: &'a str,
         context: &'a Context,
@@ -627,7 +912,7 @@ impl<'a> Exporter<'a> {
             // If we have None file it is either to a section or id within the same file and thus
             // the current embed logic will fail, recurssing until it reaches it's limit.
             // For now we just bail early.
-            None => return Ok(self.make_link_to_file(note_ref, context)),
+            None => return Ok(self.make_link_to_file_for_string(note_ref, context)),
         };
 
         if path.is_none() {
@@ -649,19 +934,20 @@ impl<'a> Exporter<'a> {
         if !self.process_embeds_recursively && context.file_tree().contains(path) {
             return Ok([
                 vec![Event::Text(CowStr::Borrowed("→ "))],
-                self.make_link_to_file(note_ref, &child_context),
+                self.make_link_to_file_for_string(note_ref, &child_context),
             ]
             .concat());
         }
 
         let events = match path.extension().unwrap_or(&no_ext).to_str() {
             Some("md") => {
-                let (frontmatter, mut events) = self.parse_obsidian_note(path, &child_context)?;
+                let (frontmatter, mut events) =
+                    self.parse_obsidian_note_for_string(path, &child_context)?;
                 child_context.frontmatter = frontmatter;
                 if let Some(section) = note_ref.section {
                     events = reduce_to_section(events, section);
                 }
-                for func in &self.embed_postprocessors {
+                for func in &self.embed_postprocessors_for_string {
                     // Postprocessors running on embeds shouldn't be able to change frontmatter (or
                     // any other metadata), so we give them a clone of the context.
                     match func(&mut child_context, &mut events) {
@@ -675,7 +961,7 @@ impl<'a> Exporter<'a> {
                 events
             }
             Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") => {
-                self.make_link_to_file(note_ref, &child_context)
+                self.make_link_to_file_for_string(note_ref, &child_context)
                     .into_iter()
                     .map(|event| match event {
                         // make_link_to_file returns a link to a file. With this we turn the link
@@ -698,12 +984,72 @@ impl<'a> Exporter<'a> {
                     })
                     .collect()
             }
-            _ => self.make_link_to_file(note_ref, &child_context),
+            _ => self.make_link_to_file_for_string(note_ref, &child_context),
         };
         Ok(events)
     }
+    /*
+        fn make_link_to_file<'c>(
+            &self,
+            reference: ObsidianNoteReference<'_>,
+            context: &Context,
+        ) -> MarkdownEvents<'c> {
+            let target_file = reference.file.map_or_else(
+                || Some(context.current_file()),
+                |file| lookup_filename_in_vault(file, self.vault_contents.as_ref().unwrap()),
+            );
 
-    fn make_link_to_file<'c>(
+            if target_file.is_none() {
+                // TODO: Extract into configurable function.
+                eprintln!(
+                    "Warning: Unable to find referenced note\n\tReference: '{}'\n\tSource: '{}'\n",
+                    reference
+                        .file
+                        .unwrap_or_else(|| context.current_file().to_str().unwrap()),
+                    context.current_file().display(),
+                );
+                return vec![
+                    Event::Start(Tag::Emphasis),
+                    Event::Text(CowStr::from(reference.display())),
+                    Event::End(TagEnd::Emphasis),
+                ];
+            }
+            let target_file = target_file.unwrap();
+            // We use root_file() rather than current_file() here to make sure links are always
+            // relative to the outer-most note, which is the note which this content is inserted into
+            // in case of embedded notes.
+            let rel_link = diff_paths(
+                target_file,
+                context
+                    .root_file()
+                    .parent()
+                    .expect("obsidian content files should always have a parent"),
+            )
+            .expect("should be able to build relative path when target file is found in vault");
+
+            let rel_link = rel_link.to_string_lossy();
+            let mut link = utf8_percent_encode(&rel_link, PERCENTENCODE_CHARS).to_string();
+
+            if let Some(section) = reference.section {
+                link.push('#');
+                link.push_str(&slugify(section));
+            }
+
+            let link_tag = Tag::Link {
+                link_type: pulldown_cmark::LinkType::Inline,
+                dest_url: CowStr::from(link),
+                title: CowStr::from(""),
+                id: CowStr::from(""),
+            };
+
+            vec![
+                Event::Start(link_tag),
+                Event::Text(CowStr::from(reference.display())),
+                Event::End(TagEnd::Link),
+            ]
+        }
+    */
+    fn make_link_to_file_for_string<'c>(
         &self,
         reference: ObsidianNoteReference<'_>,
         context: &Context,
@@ -805,6 +1151,7 @@ fn render_mdevents_to_mdtext(markdown: &MarkdownEvents<'_>) -> String {
     buffer
 }
 
+/*
 fn create_file(dest: &Path) -> Result<File> {
     let file = File::create(dest)
         .or_else(|err| {
@@ -817,6 +1164,7 @@ fn create_file(dest: &Path) -> Result<File> {
         .context(WriteSnafu { path: dest })?;
     Ok(file)
 }
+
 
 fn copy_mtime(src: &Path, dest: &Path) -> Result<()> {
     let metadata = fs::metadata(src).context(ModTimeReadSnafu { path: src })?;
@@ -840,7 +1188,7 @@ fn copy_file(src: &Path, dest: &Path) -> Result<()> {
         .context(WriteSnafu { path: dest })?;
     Ok(())
 }
-
+*/
 fn is_markdown_file(file: &Path) -> bool {
     let no_ext = OsString::new();
     let ext = file.extension().unwrap_or(&no_ext).to_string_lossy();

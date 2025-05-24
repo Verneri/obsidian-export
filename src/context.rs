@@ -13,14 +13,6 @@ use crate::Frontmatter;
 pub struct Context {
     file_tree: Vec<PathBuf>,
 
-    /// The path where this note will be written to when exported.
-    ///
-    /// Changing this path will result in the note being written to that new path instead, but
-    /// beware: links will not be updated automatically.  If this is changed by a
-    /// [postprocessor][crate::Postprocessor], it's up to that postprocessor to rewrite any
-    /// existing links to this new path.
-    pub destination: PathBuf,
-
     /// The [Frontmatter] for this note. Frontmatter may be modified in-place (see
     /// [`serde_yaml::Mapping`] for available methods) or replaced entirely.
     ///
@@ -34,7 +26,7 @@ pub struct Context {
     /// # use std::path::PathBuf;
     /// use obsidian_export::serde_yaml::Value;
     ///
-    /// # let mut context = Context::new(PathBuf::from("source"), PathBuf::from("destination"));
+    /// # let mut context = Context::new(PathBuf::from("source"));
     /// let key = Value::String("foo".to_string());
     ///
     /// context
@@ -48,10 +40,9 @@ impl Context {
     /// Create a new `Context`
     #[inline]
     #[must_use]
-    pub fn new(src: PathBuf, dest: PathBuf) -> Self {
+    pub fn new(src: PathBuf) -> Self {
         Self {
             file_tree: vec![src],
-            destination: dest,
             frontmatter: Frontmatter::new(),
         }
     }

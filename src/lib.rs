@@ -713,13 +713,15 @@ impl<'a> Exporter<'a> {
 
         if target_file.is_none() {
             // TODO: Extract into configurable function.
-            eprintln!(
-                "Warning: Unable to find referenced note\n\tReference: '{}'\n\tSource: '{}'\n",
-                reference
-                    .file
-                    .unwrap_or_else(|| context.current_file().to_str().unwrap()),
-                context.current_file().display(),
-            );
+            if context.verbose {
+                eprintln!(
+                    "Warning: Unable to find referenced note\n\tReference: '{}'\n\tSource: '{}'\n",
+                    reference
+                        .file
+                        .unwrap_or_else(|| context.current_file().to_str().unwrap()),
+                    context.current_file().display(),
+                );
+            }
             return vec![
                 Event::Start(Tag::Emphasis),
                 Event::Text(CowStr::from(reference.display())),

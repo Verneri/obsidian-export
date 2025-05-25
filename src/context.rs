@@ -34,6 +34,7 @@ pub struct Context {
     ///     .insert(key.clone(), Value::String("bar".to_string()));
     /// ```
     pub frontmatter: Frontmatter,
+    pub verbose: bool,
 }
 
 impl Context {
@@ -44,6 +45,7 @@ impl Context {
         Self {
             file_tree: vec![src],
             frontmatter: Frontmatter::new(),
+            verbose: false,
         }
     }
 

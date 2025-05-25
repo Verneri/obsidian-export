@@ -118,6 +118,20 @@ fn test_single_file() {
 }
 
 #[test]
+fn test_single_file_from_start_at() {
+    let root = PathBuf::from("tests/testdata/input/single-file/");
+    let result = Exporter::new(root.clone())
+        .start_at(root.join("note.md"))
+        .run()
+        .unwrap();
+
+    assert_eq!(
+        read_to_string("tests/testdata/expected/single-file/start-at.md").unwrap(),
+        result.get(&PathBuf::from("note.md")).unwrap().to_string(),
+    );
+}
+
+#[test]
 fn test_start_at_subdir() {
     let mut exporter = Exporter::new(PathBuf::from("tests/testdata/input/start-at/"));
     exporter.start_at(PathBuf::from("tests/testdata/input/start-at/subdir"));
